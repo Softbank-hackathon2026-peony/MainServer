@@ -7,7 +7,7 @@ from config import CORS_ORIGINS
 from service import ServiceError
 
 app = FastAPI(title="Fawploy API", docs_url=None, redoc_url=None)
-app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_methods=["GET", "POST"], allow_headers=["Content-Type", "X-Project-Token"])
+app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_methods=["GET", "POST", "DELETE"], allow_headers=["Content-Type", "X-Project-Token"])
 app.include_router(router)
 
 

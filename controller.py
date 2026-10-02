@@ -72,6 +72,16 @@ def get_analysis(project_id: str, analysis_id: str, x_project_token: str = Heade
     return response(service.get_analysis(project_id, x_project_token, analysis_id))
 
 
+@router.post("/api/v1/projects/{project_id}/analyses/{analysis_id}/build", status_code=status.HTTP_202_ACCEPTED)
+def start_build(project_id: str, analysis_id: str, x_project_token: str = Header(...)) -> dict:
+    return response(service.start_build(project_id, x_project_token, analysis_id))
+
+
+@router.get("/api/v1/projects/{project_id}/analyses/{analysis_id}/build")
+def get_build(project_id: str, analysis_id: str, x_project_token: str = Header(...)) -> dict:
+    return response(service.get_build(project_id, x_project_token, analysis_id))
+
+
 @router.post("/api/v1/projects/{project_id}/analyses", status_code=status.HTTP_202_ACCEPTED)
 def start_analysis(
     project_id: str,
@@ -107,8 +117,22 @@ def decide_analysis(
     x_project_token: str = Header(...),
 ) -> dict:
     service.require_project(project_id, x_project_token)
+    if body.action == "approve":
+        if not body.target:
+            raise service.ServiceError(422, "배포 대상을 선택해 주세요.")
+        analysis = service.get_analysis(project_id, x_project_token, analysis_id)
+        build = service.start_build(project_id, x_project_token, analysis_id)
+        deployment_id = f"dep_{uuid4().hex}"
+        service.table().put_item(Item={
+            "pk": f"PROJECT#{project_id}", "sk": f"DEPLOYMENT#{deployment_id}",
+            "deployment_id": deployment_id, "analysis_id": analysis_id,
+            "status": "running", "step": "build", "target": body.target,
+            "build_id": build["build_id"], "created_at": service.now(), "updated_at": service.now(),
+        })
+        background_tasks.add_task(service.monitor_deployment_build, project_id, deployment_id, analysis_id, build["build_id"])
+        return response({"deployment_id": deployment_id, "status": "running"})
     if body.action != "revise" or not body.revision_message:
-        raise service.ServiceError(501, "현재는 아키텍처 수정 요청만 지원합니다.")
+        raise service.ServiceError(422, "수정 요청 내용을 입력해 주세요.")
     previous = service.get_analysis(project_id, x_project_token, analysis_id)
     source_id = previous.get("source_id")
     source = service.table().get_item(Key={"pk": f"PROJECT#{project_id}", "sk": f"SOURCE#{source_id}"}).get("Item")
@@ -128,3 +152,8 @@ def decide_analysis(
         body.revision_message, previous.get("recommendation"),
     )
     return response({"analysis_id": new_id, "status": "running", "source_id": source_id})
+
+
+@router.get("/api/v1/projects/{project_id}/deployments/{deployment_id}")
+def get_deployment(project_id: str, deployment_id: str, x_project_token: str = Header(...)) -> dict:
+    return response(service.get_deployment(project_id, x_project_token, deployment_id))

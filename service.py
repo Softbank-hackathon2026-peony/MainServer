@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import secrets
+import time
 from datetime import datetime, timezone
 from functools import lru_cache
 from urllib.error import HTTPError, URLError
@@ -15,7 +16,7 @@ import boto3
 from boto3.s3.transfer import TransferConfig
 from botocore.exceptions import ClientError
 
-from config import AGENTCORE_REGION, AGENT_RUNTIME_ARN, AWS_REGION, GITHUB_TOKEN, PROJECTS_TABLE, SOURCE_BUCKET
+from config import AGENTCORE_REGION, AGENT_RUNTIME_ARN, AWS_REGION, BUILD_POLL_SECONDS, BUILD_TIMEOUT_SECONDS, CODEBUILD_PROJECT, GITHUB_TOKEN, PROJECTS_TABLE, SOURCE_BUCKET
 
 logger = logging.getLogger(__name__)
 GITHUB_API = "https://api.github.com"
@@ -55,6 +56,11 @@ def agentcore():
     if not AGENT_RUNTIME_ARN:
         raise ServiceError(503, "AgentCore Runtime이 설정되지 않았습니다.")
     return boto3.client("bedrock-agentcore", region_name=AGENTCORE_REGION)
+
+
+@lru_cache
+def codebuild():
+    return boto3.client("codebuild", region_name=AWS_REGION)
 
 
 def require_project(project_id: str, project_token: str) -> None:
@@ -302,6 +308,171 @@ def get_analysis(project_id: str, project_token: str, analysis_id: str) -> dict:
     if item.get("error_message"):
         result["error_message"] = item["error_message"]
     return result
+
+
+def start_build(project_id: str, project_token: str, analysis_id: str) -> dict:
+    """분석 결과의 소스와 build_files를 CodeBuild에 전달해 이미지 빌드를 시작한다."""
+    require_project(project_id, project_token)
+    analysis = get_analysis(project_id, project_token, analysis_id)
+    if analysis.get("status") not in {"analyzed", "ok"} or not analysis.get("recommendation"):
+        raise ServiceError(409, "분석이 완료된 뒤 이미지를 빌드할 수 있습니다.")
+    files = analysis.get("build_files") or {}
+    source_uri = analysis.get("source_uri")
+    files_uri = files.get("uri_prefix")
+    if not source_uri or not files_uri:
+        raise ServiceError(409, "분석 결과에 빌드 파일 경로가 없습니다.")
+    commit = analysis.get("commit_sha", "")
+    image_tag = f"{project_id}-{commit[:12]}"
+    try:
+        result = codebuild().start_build(
+            projectName=CODEBUILD_PROJECT,
+            environmentVariablesOverride=[
+                {"name": "SOURCE_URI", "value": source_uri, "type": "PLAINTEXT"},
+                {"name": "BUILD_FILES_URI", "value": files_uri, "type": "PLAINTEXT"},
+                {"name": "IMAGE_TAG", "value": image_tag, "type": "PLAINTEXT"},
+            ],
+        )["build"]
+    except ClientError as exc:
+        logger.exception("CodeBuild start failed for %s", analysis_id)
+        raise ServiceError(502, "이미지 빌드를 시작하지 못했습니다.") from exc
+    build_id = result["id"]
+    table().update_item(
+        Key={"pk": f"PROJECT#{project_id}", "sk": f"ANALYSIS#{analysis_id}"},
+        UpdateExpression="SET build_id = :id, build_status = :status, updated_at = :updated_at",
+        ExpressionAttributeValues={":id": build_id, ":status": result.get("buildStatus", "IN_PROGRESS"), ":updated_at": now()},
+    )
+    return {"build_id": build_id, "analysis_id": analysis_id, "status": result.get("buildStatus", "IN_PROGRESS"), "image_tag": image_tag}
+
+
+def get_build(project_id: str, project_token: str, analysis_id: str) -> dict:
+    require_project(project_id, project_token)
+    item = table().get_item(Key={"pk": f"PROJECT#{project_id}", "sk": f"ANALYSIS#{analysis_id}"}).get("Item")
+    if not item or not item.get("build_id"):
+        raise ServiceError(404, "이미지 빌드 작업을 찾을 수 없습니다.")
+    try:
+        build = codebuild().batch_get_builds(ids=[item["build_id"]])["builds"][0]
+    except (ClientError, IndexError) as exc:
+        raise ServiceError(502, "이미지 빌드 상태를 확인하지 못했습니다.") from exc
+    exported = {v["name"]: v["value"] for v in build.get("exportedEnvironmentVariables", [])}
+    status = build.get("buildStatus", "IN_PROGRESS")
+    result = {"build_id": item["build_id"], "analysis_id": analysis_id, "status": status,
+              "phase": build.get("currentPhase"),
+              "ecr_image_uri": exported.get("ECR_IMAGE_URI"), "gcp_image_uri": exported.get("GCP_IMAGE_URI")}
+    table().update_item(Key={"pk": f"PROJECT#{project_id}", "sk": f"ANALYSIS#{analysis_id}"},
+                        UpdateExpression="SET build_status = :status, updated_at = :updated_at",
+                        ExpressionAttributeValues={":status": status, ":updated_at": now()})
+    return result
+
+
+def get_deployment(project_id: str, project_token: str, deployment_id: str) -> dict:
+    require_project(project_id, project_token)
+    item = table().get_item(Key={"pk": f"PROJECT#{project_id}", "sk": f"DEPLOYMENT#{deployment_id}"}).get("Item")
+    if not item:
+        raise ServiceError(404, "배포 작업을 찾을 수 없습니다.")
+    if item.get("step") != "build":
+        if item.get("step") == "terraform" and not item.get("terraform_status"):
+            # 과거 배포가 CodeBuild 성공 후 중단된 경우, 상태 조회를 계기로 Terraform 생성을 복구한다.
+            generate_deployment_terraform(
+                project_id, deployment_id, item["analysis_id"],
+                {"ECR_IMAGE_URI": item.get("ecr_image_uri", ""), "GCP_IMAGE_URI": item.get("gcp_image_uri", "")},
+            )
+            item = table().get_item(Key={"pk": f"PROJECT#{project_id}", "sk": f"DEPLOYMENT#{deployment_id}"}).get("Item") or item
+        return {key: item[key] for key in ("deployment_id", "status", "step", "target", "ecr_image_uri", "gcp_image_uri", "reason") if key in item}
+    build = get_build(project_id, project_token, item["analysis_id"])
+    status = build["status"]
+    if status == "SUCCEEDED":
+        deploy_status, step = "running", "terraform"
+    elif status in {"FAILED", "FAULT", "STOPPED", "TIMED_OUT"}:
+        deploy_status, step = "failed", "build"
+    else:
+        deploy_status, step = "running", "build"
+    return {"deployment_id": deployment_id, "status": deploy_status, "step": step,
+            "target": item.get("target"), "build_id": build["build_id"],
+            "ecr_image_uri": build.get("ecr_image_uri"), "gcp_image_uri": build.get("gcp_image_uri")}
+
+
+def monitor_deployment_build(project_id: str, deployment_id: str, analysis_id: str, build_id: str) -> None:
+    """CodeBuild 완료를 메인 서버 상태에 반영한다. 브라우저가 닫혀도 상태가 남는다."""
+    deadline = time.monotonic() + BUILD_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        try:
+            build = codebuild().batch_get_builds(ids=[build_id])["builds"][0]
+            status = build.get("buildStatus", "IN_PROGRESS")
+            if status == "SUCCEEDED":
+                exported = {v["name"]: v["value"] for v in build.get("exportedEnvironmentVariables", [])}
+                table().update_item(
+                    Key={"pk": f"PROJECT#{project_id}", "sk": f"DEPLOYMENT#{deployment_id}"},
+                    UpdateExpression="SET #status = :status, #step = :step, build_status = :build_status, ecr_image_uri = :ecr, gcp_image_uri = :gcp, updated_at = :updated_at",
+                    ExpressionAttributeNames={"#status": "status", "#step": "step"},
+                    ExpressionAttributeValues={":status": "succeeded", ":step": "build", ":build_status": "SUCCEEDED", ":ecr": exported.get("ECR_IMAGE_URI", ""), ":gcp": exported.get("GCP_IMAGE_URI", ""), ":updated_at": now()},
+                )
+                generate_deployment_terraform(project_id, deployment_id, analysis_id, exported)
+                return
+            if status in {"FAILED", "FAULT", "STOPPED", "TIMED_OUT"}:
+                table().update_item(
+                    Key={"pk": f"PROJECT#{project_id}", "sk": f"DEPLOYMENT#{deployment_id}"},
+                    UpdateExpression="SET #status = :status, reason = :reason, updated_at = :updated_at",
+                    ExpressionAttributeNames={"#status": "status"},
+                    ExpressionAttributeValues={":status": "failed", ":reason": f"CodeBuild {status}", ":updated_at": now()},
+                )
+                return
+        except Exception:
+            logger.exception("CodeBuild monitor failed for %s", build_id)
+        time.sleep(BUILD_POLL_SECONDS)
+    table().update_item(
+        Key={"pk": f"PROJECT#{project_id}", "sk": f"DEPLOYMENT#{deployment_id}"},
+        UpdateExpression="SET #status = :status, reason = :reason, updated_at = :updated_at",
+        ExpressionAttributeNames={"#status": "status"},
+        ExpressionAttributeValues={":status": "failed", ":reason": "CodeBuild 시간 초과", ":updated_at": now()},
+    )
+
+
+def generate_deployment_terraform(project_id: str, deployment_id: str, analysis_id: str, images: dict) -> None:
+    """CodeBuild 성공 결과를 AgentCore gen_terraform에 전달하고 모듈 위치를 저장한다."""
+    try:
+        table().update_item(
+            Key={"pk": f"PROJECT#{project_id}", "sk": f"DEPLOYMENT#{deployment_id}"},
+            UpdateExpression="SET #status = :status, #step = :step, terraform_status = :tfstatus, updated_at = :updated_at",
+            ExpressionAttributeNames={"#status": "status", "#step": "step"},
+            ExpressionAttributeValues={":status": "running", ":step": "terraform", ":tfstatus": "running", ":updated_at": now()},
+        )
+        analysis = table().get_item(Key={"pk": f"PROJECT#{project_id}", "sk": f"ANALYSIS#{analysis_id}"}).get("Item") or {}
+        result_key = analysis.get("result_key")
+        if not result_key:
+            raise ServiceError(409, "분석 결과를 찾을 수 없습니다.")
+        payload = s3().get_object(Bucket=SOURCE_BUCKET, Key=result_key)["Body"].read()
+        stored = json.loads(payload)
+        recommendation = stored.get("recommendation")
+        if not recommendation:
+            raise ServiceError(409, "분석 recommendation이 없습니다.")
+        cloud = recommendation.get("cloud", "aws")
+        architecture = recommendation.get("architecture", "ec2")
+        response = agentcore().invoke_agent_runtime(
+            agentRuntimeArn=AGENT_RUNTIME_ARN,
+            runtimeSessionId=f"pawploy-tf-{project_id}-{deployment_id}",
+            payload=json.dumps({"mode": "gen_terraform", "project_id": project_id, "deploy_id": deployment_id,
+                                "recommendation": recommendation,
+                                "architectures": {cloud: architecture},
+                                "image_uris": images}).encode(),
+        )
+        result = json.loads(response["response"].read())
+        result_key = f"projects/{project_id}/deployments/{deployment_id}/terraform.json"
+        s3().put_object(Bucket=SOURCE_BUCKET, Key=result_key, Body=json.dumps(result, ensure_ascii=False).encode(), ContentType="application/json")
+        if result.get("status") not in {"ok", "partial"}:
+            raise ServiceError(502, "Terraform을 생성하지 못했습니다.")
+        table().update_item(
+            Key={"pk": f"PROJECT#{project_id}", "sk": f"DEPLOYMENT#{deployment_id}"},
+            UpdateExpression="SET terraform_uri = :uri, terraform_status = :tfstatus, updated_at = :updated_at",
+            ExpressionAttributeValues={":uri": f"s3://{SOURCE_BUCKET}/{result_key}", ":tfstatus": result.get("status"), ":updated_at": now()},
+        )
+    except Exception as exc:
+        logger.exception("Terraform generation failed for %s", deployment_id)
+        table().update_item(
+            Key={"pk": f"PROJECT#{project_id}", "sk": f"DEPLOYMENT#{deployment_id}"},
+            UpdateExpression="SET #status = :status, reason = :reason, updated_at = :updated_at",
+            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeValues={":status": "failed", ":reason": str(exc)[:500], ":updated_at": now()},
+        )
 
 
 def get_github_source(project_id: str, project_token: str, source_id: str) -> dict:
