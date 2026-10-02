@@ -15,7 +15,7 @@ import boto3
 from boto3.s3.transfer import TransferConfig
 from botocore.exceptions import ClientError
 
-from config import AWS_REGION, GITHUB_TOKEN, PROJECTS_TABLE, SOURCE_BUCKET
+from config import AGENTCORE_REGION, AGENT_RUNTIME_ARN, AWS_REGION, GITHUB_TOKEN, PROJECTS_TABLE, SOURCE_BUCKET
 
 logger = logging.getLogger(__name__)
 GITHUB_API = "https://api.github.com"
@@ -48,6 +48,13 @@ def s3():
     if not SOURCE_BUCKET:
         raise ServiceError(503, "소스 저장소가 설정되지 않았습니다.")
     return boto3.client("s3", region_name=AWS_REGION)
+
+
+@lru_cache
+def agentcore():
+    if not AGENT_RUNTIME_ARN:
+        raise ServiceError(503, "AgentCore Runtime이 설정되지 않았습니다.")
+    return boto3.client("bedrock-agentcore", region_name=AGENTCORE_REGION)
 
 
 def require_project(project_id: str, project_token: str) -> None:
@@ -213,6 +220,90 @@ def ingest_github_source(project_id: str, source_id: str, owner: str, repo: str,
             logger.exception("Failed to save source failure status for %s", source_id)
 
 
+def start_analysis(project_id: str, project_token: str, source_id: str) -> dict:
+    require_project(project_id, project_token)
+    item = table().get_item(Key={"pk": f"PROJECT#{project_id}", "sk": f"SOURCE#{source_id}"}).get("Item")
+    if not item:
+        raise ServiceError(404, "GitHub 소스 작업을 찾을 수 없습니다.")
+    if item.get("status") != "ready":
+        raise ServiceError(409, "소스 저장이 완료된 뒤 분석을 시작할 수 있습니다.")
+    analysis_id = f"ana_{uuid4().hex}"
+    run_analysis(project_id, source_id, item["commit_sha"], item["s3_key"], analysis_id)
+    return {"analysis_id": analysis_id, "status": "running", "source_id": source_id}
+
+
+def run_analysis(project_id: str, source_id: str, commit_sha: str, source_key: str, analysis_id: str,
+                 revision_message: str | None = None, previous_recommendation: dict | None = None) -> None:
+    result_key = f"projects/{project_id}/analyses/{analysis_id}.json"
+    source_uri = f"s3://{SOURCE_BUCKET}/{source_key}"
+    timestamp = now()
+    table().put_item(Item={
+        "pk": f"PROJECT#{project_id}", "sk": f"ANALYSIS#{analysis_id}",
+        "analysis_id": analysis_id, "source_id": source_id, "commit_sha": commit_sha,
+        "source_uri": source_uri, "result_key": result_key, "status": "analyzing",
+        "created_at": timestamp, "updated_at": timestamp,
+    })
+    try:
+        response = agentcore().invoke_agent_runtime(
+            agentRuntimeArn=AGENT_RUNTIME_ARN,
+            runtimeSessionId=f"pawploy-{project_id}-{uuid4().hex}",
+            payload=json.dumps({"mode": "analyze", "project_id": project_id,
+                                "source_uri": source_uri, "commit_sha": commit_sha,
+                                "analysis_id": analysis_id,
+                                **({"revision_message": revision_message, "previous_recommendation": previous_recommendation}
+                                   if revision_message else {})}).encode(),
+        )
+        result = json.loads(response["response"].read())
+        s3().put_object(Bucket=SOURCE_BUCKET, Key=result_key,
+                        Body=json.dumps(result, ensure_ascii=False).encode(),
+                        ContentType="application/json")
+        table().update_item(
+            Key={"pk": f"PROJECT#{project_id}", "sk": f"ANALYSIS#{analysis_id}"},
+            UpdateExpression="SET #status = :status, updated_at = :updated_at",
+            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeValues={":status": "analyzed" if result.get("status") == "ok" else "failed", ":updated_at": now()},
+        )
+        table().update_item(
+            Key={"pk": f"PROJECT#{project_id}", "sk": f"SOURCE#{source_id}"},
+            UpdateExpression="SET analysis_status = :status, updated_at = :updated_at",
+            ExpressionAttributeValues={":status": "analyzed" if result.get("status") == "ok" else "failed", ":updated_at": now()},
+        )
+    except Exception as exc:
+        logger.exception("AgentCore analysis failed for %s", analysis_id)
+        table().update_item(
+            Key={"pk": f"PROJECT#{project_id}", "sk": f"ANALYSIS#{analysis_id}"},
+            UpdateExpression="SET #status = :status, error_message = :error, updated_at = :updated_at",
+            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeValues={":status": "failed", ":error": str(exc)[:500], ":updated_at": now()},
+        )
+        table().update_item(
+            Key={"pk": f"PROJECT#{project_id}", "sk": f"SOURCE#{source_id}"},
+            UpdateExpression="SET analysis_status = :status, analysis_error = :error, updated_at = :updated_at",
+            ExpressionAttributeValues={":status": "failed", ":error": str(exc)[:500], ":updated_at": now()},
+        )
+
+
+def get_analysis(project_id: str, project_token: str, analysis_id: str) -> dict:
+    require_project(project_id, project_token)
+    item = table().get_item(Key={"pk": f"PROJECT#{project_id}", "sk": f"ANALYSIS#{analysis_id}"}).get("Item")
+    if not item:
+        raise ServiceError(404, "분석 작업을 찾을 수 없습니다.")
+    result = {key: item[key] for key in ("analysis_id", "source_id", "commit_sha", "source_uri", "status", "created_at", "updated_at") if key in item}
+    if item.get("result_key"):
+        result["result_uri"] = f"s3://{SOURCE_BUCKET}/{item['result_key']}"
+        if item.get("status") == "analyzed":
+            try:
+                payload = s3().get_object(Bucket=SOURCE_BUCKET, Key=item["result_key"])["Body"].read()
+                stored = json.loads(payload)
+                result.update(stored)
+                result["analysis_id"] = analysis_id
+            except (ClientError, ValueError, UnicodeDecodeError) as exc:
+                logger.warning("Analysis result unavailable for %s: %s", analysis_id, exc)
+    if item.get("error_message"):
+        result["error_message"] = item["error_message"]
+    return result
+
+
 def get_github_source(project_id: str, project_token: str, source_id: str) -> dict:
     require_project(project_id, project_token)
     try:
@@ -230,6 +321,9 @@ def get_github_source(project_id: str, project_token: str, source_id: str) -> di
         "created_at": item["created_at"],
         "updated_at": item["updated_at"],
     }
+    if item.get("analysis_id"):
+        result["analysis_id"] = item["analysis_id"]
+        result["analysis_status"] = item.get("analysis_status", "analyzing")
     if item["status"] == "ready":
         result["s3_key"] = item["s3_key"]
     if item["status"] == "failed":
