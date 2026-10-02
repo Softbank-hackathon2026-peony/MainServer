@@ -2,11 +2,10 @@ from datetime import datetime, timezone
 from typing import Optional
 from uuid import uuid4
 
-from fastapi import APIRouter, Header, status
+from fastapi import APIRouter, BackgroundTasks, Header, status
 from pydantic import BaseModel, Field
 
 import service
-from config import MAX_OBJECT_BYTES, MAX_PARTS
 
 router = APIRouter()
 
@@ -15,19 +14,9 @@ class ProjectCreate(BaseModel):
     name: str = Field(min_length=1, max_length=80)
 
 
-class UploadCreate(BaseModel):
-    file_name: str = Field(min_length=1, max_length=255)
-    size_bytes: int = Field(ge=1, le=MAX_OBJECT_BYTES)
-    relative_path: Optional[str] = Field(default=None, min_length=1, max_length=900)
-
-
-class CompletedPart(BaseModel):
-    part_number: int = Field(ge=1, le=MAX_PARTS)
-    etag: str = Field(min_length=1, max_length=200)
-
-
-class UploadComplete(BaseModel):
-    parts: list[CompletedPart] = Field(min_length=1, max_length=MAX_PARTS)
+class GitHubSourceCreate(BaseModel):
+    github_url: str = Field(min_length=1, max_length=2048)
+    ref: Optional[str] = Field(default=None, min_length=1, max_length=200)
 
 
 def response(data: dict) -> dict:
@@ -44,21 +33,25 @@ def create_project(body: ProjectCreate) -> dict:
     return response(service.create_project(body.name))
 
 
-@router.post("/api/v1/projects/{project_id}/uploads/presign", status_code=status.HTTP_201_CREATED)
-def presign_upload(project_id: str, body: UploadCreate, x_project_token: str = Header(...)) -> dict:
-    return response(service.start_upload(project_id, x_project_token, body.file_name, body.size_bytes, body.relative_path))
+@router.post("/api/v1/projects/{project_id}/sources/github", status_code=status.HTTP_202_ACCEPTED)
+def create_github_source(
+    project_id: str,
+    body: GitHubSourceCreate,
+    background_tasks: BackgroundTasks,
+    x_project_token: str = Header(...),
+) -> dict:
+    data = service.create_github_source(project_id, x_project_token, body.github_url, body.ref)
+    background_tasks.add_task(
+        service.ingest_github_source,
+        project_id,
+        data["source_id"],
+        data["owner"],
+        data["repo"],
+        data["commit_sha"],
+    )
+    return response({key: value for key, value in data.items() if key not in {"owner", "repo"}})
 
 
-@router.get("/api/v1/projects/{project_id}/uploads/{upload_id}/parts/{part_number}/presign")
-def presign_part(project_id: str, upload_id: str, part_number: int, x_project_token: str = Header(...)) -> dict:
-    return response(service.presign_part(project_id, x_project_token, upload_id, part_number))
-
-
-@router.post("/api/v1/projects/{project_id}/uploads/{upload_id}/complete")
-def complete_upload(project_id: str, upload_id: str, body: UploadComplete, x_project_token: str = Header(...)) -> dict:
-    return response(service.complete_upload(project_id, x_project_token, upload_id, [part.model_dump() for part in body.parts]))
-
-
-@router.delete("/api/v1/projects/{project_id}/uploads/{upload_id}", status_code=204)
-def abort_upload(project_id: str, upload_id: str, x_project_token: str = Header(...)) -> None:
-    service.abort_upload(project_id, x_project_token, upload_id)
+@router.get("/api/v1/projects/{project_id}/sources/{source_id}")
+def get_github_source(project_id: str, source_id: str, x_project_token: str = Header(...)) -> dict:
+    return response(service.get_github_source(project_id, x_project_token, source_id))

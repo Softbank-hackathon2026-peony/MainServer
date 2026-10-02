@@ -1,27 +1,29 @@
 import hashlib
 import hmac
-import math
-import mimetypes
+import json
+import logging
+import re
 import secrets
 from datetime import datetime, timezone
 from functools import lru_cache
-from pathlib import Path
-from typing import Optional
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlsplit
+from urllib.request import Request, urlopen
 from uuid import uuid4
 
 import boto3
-from botocore.config import Config
+from boto3.s3.transfer import TransferConfig
 from botocore.exceptions import ClientError
 
-from config import (
-    AWS_REGION,
-    MAX_PARTS,
-    MAX_PART_BYTES,
-    MIN_PART_BYTES,
-    MIB,
-    PROJECTS_TABLE,
-    UPLOAD_BUCKET,
-)
+from config import AWS_REGION, GITHUB_TOKEN, PROJECTS_TABLE, SOURCE_BUCKET
+
+logger = logging.getLogger(__name__)
+GITHUB_API = "https://api.github.com"
+OWNER_PATTERN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?")
+REPO_PATTERN = re.compile(r"[A-Za-z0-9_.-]+")
+REF_PATTERN = re.compile(r"[A-Za-z0-9._/-]+")
+SHA_PATTERN = re.compile(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}")
+TRANSFER = TransferConfig(multipart_threshold=8 * 1024 * 1024, multipart_chunksize=16 * 1024 * 1024)
 
 
 class ServiceError(Exception):
@@ -43,14 +45,9 @@ def table():
 
 @lru_cache
 def s3():
-    if not UPLOAD_BUCKET:
-        raise ServiceError(503, "업로드 저장소가 설정되지 않았습니다.")
-    return boto3.client(
-        "s3",
-        region_name=AWS_REGION,
-        endpoint_url=f"https://s3.{AWS_REGION}.amazonaws.com",
-        config=Config(signature_version="s3v4", s3={"addressing_style": "virtual"}),
-    )
+    if not SOURCE_BUCKET:
+        raise ServiceError(503, "소스 저장소가 설정되지 않았습니다.")
+    return boto3.client("s3", region_name=AWS_REGION)
 
 
 def require_project(project_id: str, project_token: str) -> None:
@@ -61,16 +58,6 @@ def require_project(project_id: str, project_token: str) -> None:
     token_hash = hashlib.sha256(project_token.encode()).hexdigest()
     if not item or not hmac.compare_digest(item["token_hash"], token_hash):
         raise ServiceError(404, "프로젝트를 찾을 수 없습니다.")
-
-
-def upload_record(project_id: str, upload_id: str) -> dict:
-    try:
-        item = table().get_item(Key={"pk": f"PROJECT#{project_id}", "sk": f"UPLOAD#{upload_id}"}).get("Item")
-    except ClientError as exc:
-        raise ServiceError(503, "업로드 작업을 확인할 수 없습니다.") from exc
-    if not item:
-        raise ServiceError(404, "업로드 작업을 찾을 수 없습니다.")
-    return item
 
 
 def create_project(name: str) -> dict:
@@ -95,126 +82,156 @@ def create_project(name: str) -> dict:
     return {"project_id": project_id, "project_token": token, "name": clean_name}
 
 
-def start_upload(project_id: str, project_token: str, file_name: str, size_bytes: int, relative_path: Optional[str] = None) -> dict:
-    require_project(project_id, project_token)
-    original_name = Path(file_name).name
-    if original_name in {"", ".", ".."} or "\\" in file_name or any(ord(char) < 32 for char in file_name):
-        raise ServiceError(422, "파일 이름이 올바르지 않습니다.")
-    object_path = relative_path or original_name
-    segments = object_path.split("/")
-    if (
-        object_path.startswith("/")
-        or any(segment in {"", ".", ".."} for segment in segments)
-        or segments[-1] != original_name
-        or "\\" in object_path
-        or any(ord(char) < 32 for char in object_path)
-    ):
-        raise ServiceError(422, "파일 경로가 올바르지 않습니다.")
-    upload_id = f"upl_{uuid4().hex}"
-    object_key = f"projects/{project_id}/uploads/{upload_id}/{object_path}"
-    if len(object_key.encode("utf-8")) > 1024:
-        raise ServiceError(422, "파일 경로가 너무 깁니다.")
-    content_type = mimetypes.guess_type(original_name)[0] or "application/octet-stream"
-    if Path(original_name).suffix.lower() in {".ts", ".tgz"}:
-        content_type = "application/octet-stream"
-    part_size = max(MIN_PART_BYTES, math.ceil(size_bytes / MAX_PARTS / MIB) * MIB)
-    if part_size > MAX_PART_BYTES:
-        raise ServiceError(413, "S3에서 지원하는 최대 객체 크기를 초과했습니다.")
-    total_parts = math.ceil(size_bytes / part_size)
+def parse_github_url(github_url: str) -> tuple[str, str, str]:
     try:
-        s3_upload_id = s3().create_multipart_upload(Bucket=UPLOAD_BUCKET, Key=object_key, ContentType=content_type)["UploadId"]
-    except ClientError as exc:
-        raise ServiceError(503, "S3 업로드를 시작할 수 없습니다.") from exc
+        parsed = urlsplit(github_url.strip())
+        valid_origin = parsed.scheme == "https" and parsed.hostname == "github.com" and parsed.port is None
+    except ValueError:
+        valid_origin = False
+    if not valid_origin or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ServiceError(422, "공개 GitHub 저장소의 HTTPS 주소를 입력해 주세요.")
+    segments = parsed.path.strip("/").split("/")
+    if len(segments) != 2:
+        raise ServiceError(422, "저장소 주소는 https://github.com/소유자/저장소 형식이어야 합니다.")
+    owner, repo = segments
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+    if not OWNER_PATTERN.fullmatch(owner) or not REPO_PATTERN.fullmatch(repo):
+        raise ServiceError(422, "GitHub 저장소 주소가 올바르지 않습니다.")
+    return owner, repo, f"https://github.com/{owner}/{repo}"
+
+
+def github_open(path: str):
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "Fawploy-MainServer"}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    request = Request(f"{GITHUB_API}{path}", headers=headers)
+    try:
+        return urlopen(request, timeout=30)
+    except HTTPError as exc:
+        if exc.code == 404:
+            raise ServiceError(404, "공개 GitHub 저장소 또는 커밋을 찾을 수 없습니다.") from exc
+        if exc.code in {403, 429}:
+            raise ServiceError(503, "GitHub 요청이 제한되었습니다. 잠시 후 다시 시도해 주세요.") from exc
+        raise ServiceError(502, "GitHub에서 소스를 가져올 수 없습니다.") from exc
+    except (URLError, TimeoutError) as exc:
+        raise ServiceError(502, "GitHub 연결에 실패했습니다. 다시 시도해 주세요.") from exc
+
+
+def github_json(path: str) -> dict:
+    try:
+        with github_open(path) as response:
+            return json.load(response)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ServiceError(502, "GitHub 응답을 확인할 수 없습니다.") from exc
+
+
+def create_github_source(project_id: str, project_token: str, github_url: str, ref: str | None) -> dict:
+    require_project(project_id, project_token)
+    owner, repo, canonical_url = parse_github_url(github_url)
+    if not SOURCE_BUCKET:
+        raise ServiceError(503, "소스 저장소가 설정되지 않았습니다.")
+    if ref is not None:
+        ref = ref.strip()
+        if not REF_PATTERN.fullmatch(ref):
+            raise ServiceError(422, "브랜치, 태그 또는 커밋 값이 올바르지 않습니다.")
+    repository = github_json(f"/repos/{owner}/{repo}")
+    if repository.get("private") or not repository.get("default_branch"):
+        raise ServiceError(422, "공개되어 있고 비어 있지 않은 GitHub 저장소만 사용할 수 있습니다.")
+    chosen_ref = ref or repository["default_branch"]
+    commit = github_json(f"/repos/{owner}/{repo}/commits/{quote(chosen_ref, safe='')}")
+    commit_sha = commit.get("sha", "")
+    if not SHA_PATTERN.fullmatch(commit_sha):
+        raise ServiceError(502, "GitHub 커밋을 확인할 수 없습니다.")
+    source_id = f"src_{uuid4().hex}"
+    object_key = f"projects/{project_id}/sources/{source_id}/{commit_sha}.tar.gz"
+    timestamp = now()
     try:
         table().put_item(
             Item={
                 "pk": f"PROJECT#{project_id}",
-                "sk": f"UPLOAD#{upload_id}",
-                "file_name": original_name,
-                "relative_path": object_path,
-                "size_bytes": size_bytes,
-                "content_type": content_type,
-                "object_key": object_key,
-                "s3_upload_id": s3_upload_id,
-                "part_size": part_size,
-                "total_parts": total_parts,
-                "status": "uploading",
-                "created_at": now(),
+                "sk": f"SOURCE#{source_id}",
+                "repository_url": canonical_url,
+                "owner": owner,
+                "repo": repo,
+                "ref": chosen_ref,
+                "commit_sha": commit_sha,
+                "s3_key": object_key,
+                "status": "queued",
+                "created_at": timestamp,
+                "updated_at": timestamp,
             },
             ConditionExpression="attribute_not_exists(pk) AND attribute_not_exists(sk)",
         )
     except ClientError as exc:
-        s3().abort_multipart_upload(Bucket=UPLOAD_BUCKET, Key=object_key, UploadId=s3_upload_id)
-        raise ServiceError(503, "업로드 작업을 저장할 수 없습니다.") from exc
-    return {"upload_id": upload_id, "part_size": part_size, "total_parts": total_parts}
+        raise ServiceError(503, "GitHub 소스 작업을 저장할 수 없습니다.") from exc
+    return {
+        "source_id": source_id,
+        "status": "queued",
+        "repository_url": canonical_url,
+        "ref": chosen_ref,
+        "commit_sha": commit_sha,
+        "owner": owner,
+        "repo": repo,
+    }
 
 
-def presign_part(project_id: str, project_token: str, upload_id: str, part_number: int) -> dict:
-    require_project(project_id, project_token)
-    record = upload_record(project_id, upload_id)
-    if record["status"] != "uploading":
-        raise ServiceError(409, "업로드할 수 없는 상태입니다.")
-    if not 1 <= part_number <= record["total_parts"]:
-        raise ServiceError(400, "잘못된 파일 조각 번호입니다.")
-    url = s3().generate_presigned_url(
-        "upload_part",
-        Params={
-            "Bucket": UPLOAD_BUCKET,
-            "Key": record["object_key"],
-            "UploadId": record["s3_upload_id"],
-            "PartNumber": part_number,
-        },
-        ExpiresIn=900,
-        HttpMethod="PUT",
+def update_source_status(project_id: str, source_id: str, status: str, error_message: str | None = None) -> None:
+    values = {":status": status, ":updated_at": now()}
+    expression = "SET #status = :status, updated_at = :updated_at"
+    if error_message:
+        expression += ", error_message = :error_message"
+        values[":error_message"] = error_message
+    table().update_item(
+        Key={"pk": f"PROJECT#{project_id}", "sk": f"SOURCE#{source_id}"},
+        UpdateExpression=expression,
+        ExpressionAttributeNames={"#status": "status"},
+        ExpressionAttributeValues=values,
+        ConditionExpression="attribute_exists(pk) AND attribute_exists(sk)",
     )
-    return {"upload_url": url, "expires_in": 900}
 
 
-def complete_upload(project_id: str, project_token: str, upload_id: str, parts: list[dict]) -> dict:
-    require_project(project_id, project_token)
-    record = upload_record(project_id, upload_id)
-    if record["status"] == "uploaded":
-        return {"project_id": project_id, "upload_id": upload_id, "status": "uploaded"}
-    if record["status"] != "uploading":
-        raise ServiceError(409, "완료할 수 없는 업로드 상태입니다.")
-    total_parts = int(record["total_parts"])
-    if len(parts) != total_parts or [part["part_number"] for part in parts] != list(range(1, total_parts + 1)):
-        raise ServiceError(422, "파일 조각 목록이 올바르지 않습니다.")
+def ingest_github_source(project_id: str, source_id: str, owner: str, repo: str, commit_sha: str) -> None:
+    object_key = f"projects/{project_id}/sources/{source_id}/{commit_sha}.tar.gz"
     try:
-        s3().complete_multipart_upload(
-            Bucket=UPLOAD_BUCKET,
-            Key=record["object_key"],
-            UploadId=record["s3_upload_id"],
-            MultipartUpload={"Parts": [{"PartNumber": part["part_number"], "ETag": part["etag"]} for part in parts]},
-        )
-        obj = s3().head_object(Bucket=UPLOAD_BUCKET, Key=record["object_key"])
-        if obj["ContentLength"] != record["size_bytes"] or obj.get("ContentType") != record["content_type"]:
-            s3().delete_object(Bucket=UPLOAD_BUCKET, Key=record["object_key"])
-            raise ServiceError(422, "업로드된 파일 정보가 요청과 다릅니다. 다시 시도해 주세요.")
-        table().update_item(
-            Key={"pk": f"PROJECT#{project_id}", "sk": f"UPLOAD#{upload_id}"},
-            UpdateExpression="SET #s = :uploaded, completed_at = :completed_at",
-            ConditionExpression="#s = :uploading",
-            ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={":uploaded": "uploaded", ":uploading": "uploading", ":completed_at": now()},
-        )
-    except ClientError as exc:
-        raise ServiceError(503, "업로드 완료를 확인할 수 없습니다.") from exc
-    return {"project_id": project_id, "upload_id": upload_id, "status": "uploaded"}
+        update_source_status(project_id, source_id, "downloading")
+        with github_open(f"/repos/{owner}/{repo}/tarball/{commit_sha}") as archive:
+            s3().upload_fileobj(
+                archive,
+                SOURCE_BUCKET,
+                object_key,
+                ExtraArgs={"ContentType": "application/gzip", "Metadata": {"commit-sha": commit_sha}},
+                Config=TRANSFER,
+            )
+        update_source_status(project_id, source_id, "ready")
+    except Exception as exc:
+        logger.exception("GitHub source ingestion failed for %s", source_id)
+        message = exc.message if isinstance(exc, ServiceError) else "GitHub 소스를 저장하지 못했습니다. 다시 시도해 주세요."
+        try:
+            update_source_status(project_id, source_id, "failed", message)
+        except Exception:
+            logger.exception("Failed to save source failure status for %s", source_id)
 
 
-def abort_upload(project_id: str, project_token: str, upload_id: str) -> None:
+def get_github_source(project_id: str, project_token: str, source_id: str) -> dict:
     require_project(project_id, project_token)
-    record = upload_record(project_id, upload_id)
-    if record["status"] != "uploading":
-        raise ServiceError(409, "중단할 수 없는 업로드 상태입니다.")
     try:
-        s3().abort_multipart_upload(Bucket=UPLOAD_BUCKET, Key=record["object_key"], UploadId=record["s3_upload_id"])
-        table().update_item(
-            Key={"pk": f"PROJECT#{project_id}", "sk": f"UPLOAD#{upload_id}"},
-            UpdateExpression="SET #s = :aborted",
-            ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={":aborted": "aborted"},
-        )
+        item = table().get_item(Key={"pk": f"PROJECT#{project_id}", "sk": f"SOURCE#{source_id}"}).get("Item")
     except ClientError as exc:
-        raise ServiceError(503, "업로드를 중단할 수 없습니다.") from exc
+        raise ServiceError(503, "GitHub 소스 작업을 확인할 수 없습니다.") from exc
+    if not item:
+        raise ServiceError(404, "GitHub 소스 작업을 찾을 수 없습니다.")
+    result = {
+        "source_id": source_id,
+        "status": item["status"],
+        "repository_url": item["repository_url"],
+        "ref": item["ref"],
+        "commit_sha": item["commit_sha"],
+        "created_at": item["created_at"],
+        "updated_at": item["updated_at"],
+    }
+    if item["status"] == "ready":
+        result["s3_key"] = item["s3_key"]
+    if item["status"] == "failed":
+        result["error_message"] = item.get("error_message", "GitHub 소스를 저장하지 못했습니다.")
+    return result

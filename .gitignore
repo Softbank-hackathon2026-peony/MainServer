@@ -6,3 +6,8 @@ __pycache__/
 .env
 .env.*
 !.env.example
+terraform/.terraform/
+terraform/terraform.tfstate*
+terraform/terraform.tfvars
+terraform/*.tfplan
+terraform/backend.zip
