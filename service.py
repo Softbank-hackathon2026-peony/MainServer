@@ -16,7 +16,7 @@ import boto3
 from boto3.s3.transfer import TransferConfig
 from botocore.exceptions import ClientError
 
-from config import AGENTCORE_REGION, AGENT_RUNTIME_ARN, AWS_REGION, BUILD_POLL_SECONDS, BUILD_TIMEOUT_SECONDS, CODEBUILD_PROJECT, GITHUB_TOKEN, PROJECTS_TABLE, SOURCE_BUCKET
+from config import AGENTCORE_REGION, AGENT_RUNTIME_ARN, AWS_REGION, BUILD_POLL_SECONDS, BUILD_TIMEOUT_SECONDS, CODEBUILD_PROJECT, GITHUB_TOKEN, PROJECTS_TABLE, SOURCE_BUCKET, WORKER_ARTIFACT_BUCKET, WORKER_DESTROY_QUEUE_URL, WORKER_QUEUE_URL, WORKER_REGION, WORKER_STATUS_TABLE
 
 logger = logging.getLogger(__name__)
 GITHUB_API = "https://api.github.com"
@@ -61,6 +61,16 @@ def agentcore():
 @lru_cache
 def codebuild():
     return boto3.client("codebuild", region_name=AWS_REGION)
+
+
+@lru_cache
+def sqs():
+    return boto3.client("sqs", region_name=WORKER_REGION)
+
+
+@lru_cache
+def worker_table():
+    return boto3.resource("dynamodb", region_name=WORKER_REGION).Table(WORKER_STATUS_TABLE)
 
 
 def require_project(project_id: str, project_token: str) -> None:
@@ -324,14 +334,19 @@ def start_build(project_id: str, project_token: str, analysis_id: str) -> dict:
     commit = analysis.get("commit_sha", "")
     image_tag = f"{project_id}-{commit[:12]}"
     try:
-        result = codebuild().start_build(
-            projectName=CODEBUILD_PROJECT,
-            environmentVariablesOverride=[
+        build_request = {
+            "projectName": CODEBUILD_PROJECT,
+            "environmentVariablesOverride": [
                 {"name": "SOURCE_URI", "value": source_uri, "type": "PLAINTEXT"},
                 {"name": "BUILD_FILES_URI", "value": files_uri, "type": "PLAINTEXT"},
                 {"name": "IMAGE_TAG", "value": image_tag, "type": "PLAINTEXT"},
             ],
-        )["build"]
+        }
+        # AgentCore가 분석 결과와 함께 만든 buildspec을 CodeBuild에 명시적으로 전달한다.
+        # 전달하지 않으면 CodeBuild 프로젝트에 고정된 단일 컨테이너 buildspec이 사용된다.
+        if files.get("buildspec"):
+            build_request["buildspecOverride"] = files["buildspec"]
+        result = codebuild().start_build(**build_request)["build"]
     except ClientError as exc:
         logger.exception("CodeBuild start failed for %s", analysis_id)
         raise ServiceError(502, "이미지 빌드를 시작하지 못했습니다.") from exc
@@ -358,6 +373,11 @@ def get_build(project_id: str, project_token: str, analysis_id: str) -> dict:
     result = {"build_id": item["build_id"], "analysis_id": analysis_id, "status": status,
               "phase": build.get("currentPhase"),
               "ecr_image_uri": exported.get("ECR_IMAGE_URI"), "gcp_image_uri": exported.get("GCP_IMAGE_URI")}
+    if exported.get("IMAGE_DIGESTS"):
+        try:
+            result["image_digests"] = json.loads(exported["IMAGE_DIGESTS"])
+        except json.JSONDecodeError:
+            result["image_digests"] = {}
     table().update_item(Key={"pk": f"PROJECT#{project_id}", "sk": f"ANALYSIS#{analysis_id}"},
                         UpdateExpression="SET build_status = :status, updated_at = :updated_at",
                         ExpressionAttributeValues={":status": status, ":updated_at": now()})
@@ -369,26 +389,60 @@ def get_deployment(project_id: str, project_token: str, deployment_id: str) -> d
     item = table().get_item(Key={"pk": f"PROJECT#{project_id}", "sk": f"DEPLOYMENT#{deployment_id}"}).get("Item")
     if not item:
         raise ServiceError(404, "배포 작업을 찾을 수 없습니다.")
-    if item.get("step") != "build":
-        if item.get("step") == "terraform" and not item.get("terraform_status"):
-            # 과거 배포가 CodeBuild 성공 후 중단된 경우, 상태 조회를 계기로 Terraform 생성을 복구한다.
-            generate_deployment_terraform(
-                project_id, deployment_id, item["analysis_id"],
-                {"ECR_IMAGE_URI": item.get("ecr_image_uri", ""), "GCP_IMAGE_URI": item.get("gcp_image_uri", "")},
+    if item.get("step") == "build":
+        build = get_build(project_id, project_token, item["analysis_id"])
+        if build["status"] == "SUCCEEDED":
+            # 과거 배포처럼 CodeBuild는 끝났지만 백그라운드 작업이 끊긴 경우에도
+            # 프론트의 상태 폴링을 계기로 gen_terraform을 반드시 시작한다.
+            table().update_item(
+                Key={"pk": f"PROJECT#{project_id}", "sk": f"DEPLOYMENT#{deployment_id}"},
+                UpdateExpression="SET #status = :status, #step = :step, ecr_image_uri = :ecr, gcp_image_uri = :gcp, updated_at = :updated_at",
+                ExpressionAttributeNames={"#status": "status", "#step": "step"},
+                ExpressionAttributeValues={":status": "running", ":step": "terraform", ":ecr": build.get("ecr_image_uri", ""), ":gcp": build.get("gcp_image_uri", ""), ":updated_at": now()},
             )
             item = table().get_item(Key={"pk": f"PROJECT#{project_id}", "sk": f"DEPLOYMENT#{deployment_id}"}).get("Item") or item
-        return {key: item[key] for key in ("deployment_id", "status", "step", "target", "ecr_image_uri", "gcp_image_uri", "reason") if key in item}
-    build = get_build(project_id, project_token, item["analysis_id"])
-    status = build["status"]
-    if status == "SUCCEEDED":
-        deploy_status, step = "running", "terraform"
-    elif status in {"FAILED", "FAULT", "STOPPED", "TIMED_OUT"}:
-        deploy_status, step = "failed", "build"
-    else:
-        deploy_status, step = "running", "build"
-    return {"deployment_id": deployment_id, "status": deploy_status, "step": step,
-            "target": item.get("target"), "build_id": build["build_id"],
-            "ecr_image_uri": build.get("ecr_image_uri"), "gcp_image_uri": build.get("gcp_image_uri")}
+        else:
+            status = "failed" if build["status"] in {"FAILED", "FAULT", "STOPPED", "TIMED_OUT"} else "running"
+            return {"deployment_id": deployment_id, "status": status, "step": "build", "target": item.get("target"),
+                    "build_id": build["build_id"], "ecr_image_uri": build.get("ecr_image_uri"), "gcp_image_uri": build.get("gcp_image_uri")}
+
+    if item.get("step") == "terraform" and not item.get("terraform_status"):
+        # CodeBuild 성공 후 서버 재시작/배경 작업 중단으로 누락된 Terraform 생성을 복구한다.
+        generate_deployment_terraform(
+            project_id, deployment_id, item["analysis_id"],
+            {"ECR_IMAGE_URI": item.get("ecr_image_uri", ""), "GCP_IMAGE_URI": item.get("gcp_image_uri", "")},
+        )
+        item = table().get_item(Key={"pk": f"PROJECT#{project_id}", "sk": f"DEPLOYMENT#{deployment_id}"}).get("Item") or item
+    result = {key: item[key] for key in ("deployment_id", "status", "step", "target", "ecr_image_uri", "gcp_image_uri", "reason", "url", "expires_at", "worker_deploy_id") if key in item}
+    if item.get("worker_deploy_id"):
+        worker = worker_table().get_item(Key={"deploy_id": item["worker_deploy_id"]}).get("Item")
+        if worker:
+            worker_view = _worker_status(item, worker)
+            result.update(worker_view)
+            # Worker가 기록한 최종 상태를 Main DB에도 반영해 새 요청/재시작 후에도
+            # 같은 상태를 반환한다. 프론트는 url이 생기면 health 폴링을 종료한다.
+            update_values = {
+                ":status": worker_view["status"],
+                ":step": worker_view["step"],
+                ":updated_at": now(),
+            }
+            update_expression = "SET #status = :status, #step = :step, updated_at = :updated_at"
+            if "url" in worker_view:
+                update_expression += ", url = :url"
+                update_values[":url"] = worker_view["url"]
+            if "expires_at" in worker_view:
+                update_expression += ", expires_at = :expires_at"
+                update_values[":expires_at"] = worker_view["expires_at"]
+            if "reason" in worker_view:
+                update_expression += ", reason = :reason"
+                update_values[":reason"] = worker_view["reason"]
+            table().update_item(
+                Key={"pk": f"PROJECT#{project_id}", "sk": f"DEPLOYMENT#{deployment_id}"},
+                UpdateExpression=update_expression,
+                ExpressionAttributeNames={"#status": "status", "#step": "step"},
+                ExpressionAttributeValues=update_values,
+            )
+    return result
 
 
 def monitor_deployment_build(project_id: str, deployment_id: str, analysis_id: str, build_id: str) -> None:
@@ -465,6 +519,7 @@ def generate_deployment_terraform(project_id: str, deployment_id: str, analysis_
             UpdateExpression="SET terraform_uri = :uri, terraform_status = :tfstatus, updated_at = :updated_at",
             ExpressionAttributeValues={":uri": f"s3://{SOURCE_BUCKET}/{result_key}", ":tfstatus": result.get("status"), ":updated_at": now()},
         )
+        enqueue_worker_deployment(project_id, deployment_id, analysis_id, recommendation, result, images)
     except Exception as exc:
         logger.exception("Terraform generation failed for %s", deployment_id)
         table().update_item(
@@ -473,6 +528,90 @@ def generate_deployment_terraform(project_id: str, deployment_id: str, analysis_
             ExpressionAttributeNames={"#status": "status"},
             ExpressionAttributeValues={":status": "failed", ":reason": str(exc)[:500], ":updated_at": now()},
         )
+
+
+def _worker_status(item: dict, worker: dict) -> dict:
+    """Terraform-worker result.json을 Main Server 배포 응답으로 매핑한다."""
+    target = item.get("target", "")
+    cloud = "gcp" if target.startswith("gcp") else "aws"
+    worker_target = (worker.get("targets") or {}).get(cloud) or {}
+    status = worker.get("status", "deploying")
+    step = worker_target.get("status") or "terraform"
+    if step == "health_check":
+        step = "health"
+    mapped = {"status": status, "step": step}
+    if worker_target.get("health_url") or worker_target.get("endpoint"):
+        mapped["url"] = worker_target.get("health_url") or worker_target.get("endpoint")
+    if worker.get("expires_at"):
+        mapped["expires_at"] = worker["expires_at"]
+    reason = worker_target.get("error") or worker.get("error")
+    if reason:
+        mapped["reason"] = reason
+    return mapped
+
+
+def enqueue_worker_deployment(project_id: str, deployment_id: str, analysis_id: str, recommendation: dict, terraform_result: dict, images: dict) -> None:
+    """AgentCore 모듈 생성 후 작업 JSON을 S3에 저장하고 Terraform-worker 큐에 넣는다."""
+    cloud = recommendation.get("cloud", "aws")
+    architecture = recommendation.get("architecture", "ec2")
+    targets = terraform_result.get("targets") or []
+    if isinstance(targets, dict):
+        targets = [{"cloud": key, **value} for key, value in targets.items()]
+    generated = next((target for target in targets if target.get("cloud") == cloud and target.get("architecture", architecture) == architecture), None)
+    if not generated:
+        generated = next((target for target in targets if target.get("cloud") == cloud), None)
+    terraform_uri = (generated or {}).get("module_uri") or (generated or {}).get("terraform_uri")
+    image_uri = images.get("ECR_IMAGE_URI") if cloud == "aws" else images.get("GCP_IMAGE_URI")
+    if not image_uri or not terraform_uri:
+        raise ServiceError(502, "Terraform-worker에 전달할 이미지 또는 Terraform 모듈 경로가 없습니다.")
+
+    # Worker의 ID 규칙(소문자·숫자·하이픈)에 맞춘 별도 ID를 사용한다.
+    worker_deploy_id = deployment_id.replace("_", "-")[:40]
+    request_id = uuid4().hex
+    key = f"jobs/{worker_deploy_id}/{request_id}.json"
+    job = {
+        "deploy_id": worker_deploy_id,
+        "project_id": project_id,
+        "container_port": recommendation.get("container_port", 8080),
+        "size": recommendation.get("size", "small"),
+        "health_path": recommendation.get("health_path", "/"),
+        "env": recommendation.get("env") or {},
+        "targets": [{"cloud": cloud, "architecture": architecture, "image_uri": image_uri, "terraform_uri": terraform_uri}],
+    }
+    boto3.client("s3", region_name=WORKER_REGION).put_object(
+        Bucket=WORKER_ARTIFACT_BUCKET, Key=key,
+        Body=json.dumps(job, ensure_ascii=False).encode(), ContentType="application/json",
+    )
+    sqs().send_message(
+        QueueUrl=WORKER_QUEUE_URL,
+        MessageBody=json.dumps({"action": "deploy", "job_uri": f"s3://{WORKER_ARTIFACT_BUCKET}/{key}"}),
+        MessageGroupId=worker_deploy_id,
+        MessageDeduplicationId=request_id,
+    )
+    table().update_item(
+        Key={"pk": f"PROJECT#{project_id}", "sk": f"DEPLOYMENT#{deployment_id}"},
+        UpdateExpression="SET worker_deploy_id = :id, worker_job_uri = :uri, #status = :status, #step = :step, updated_at = :updated_at",
+        ExpressionAttributeNames={"#status": "status", "#step": "step"},
+        ExpressionAttributeValues={":id": worker_deploy_id, ":uri": f"s3://{WORKER_ARTIFACT_BUCKET}/{key}", ":status": "running", ":step": "terraform", ":updated_at": now()},
+    )
+
+
+def stop_deployment(project_id: str, project_token: str, deployment_id: str) -> None:
+    require_project(project_id, project_token)
+    item = table().get_item(Key={"pk": f"PROJECT#{project_id}", "sk": f"DEPLOYMENT#{deployment_id}"}).get("Item")
+    if not item:
+        raise ServiceError(404, "배포 작업을 찾을 수 없습니다.")
+    worker_deploy_id = item.get("worker_deploy_id") or deployment_id.replace("_", "-")[:40]
+    sqs().send_message(
+        QueueUrl=WORKER_DESTROY_QUEUE_URL,
+        MessageBody=json.dumps({"action": "destroy", "deploy_id": worker_deploy_id, "project_id": project_id}),
+    )
+    table().update_item(
+        Key={"pk": f"PROJECT#{project_id}", "sk": f"DEPLOYMENT#{deployment_id}"},
+        UpdateExpression="SET #status = :status, #step = :step, updated_at = :updated_at",
+        ExpressionAttributeNames={"#status": "status", "#step": "step"},
+        ExpressionAttributeValues={":status": "destroying", ":step": "health", ":updated_at": now()},
+    )
 
 
 def get_github_source(project_id: str, project_token: str, source_id: str) -> dict:

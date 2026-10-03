@@ -122,7 +122,7 @@ def decide_analysis(
             raise service.ServiceError(422, "배포 대상을 선택해 주세요.")
         analysis = service.get_analysis(project_id, x_project_token, analysis_id)
         build = service.start_build(project_id, x_project_token, analysis_id)
-        deployment_id = f"dep_{uuid4().hex}"
+        deployment_id = f"dep-{uuid4().hex}"
         service.table().put_item(Item={
             "pk": f"PROJECT#{project_id}", "sk": f"DEPLOYMENT#{deployment_id}",
             "deployment_id": deployment_id, "analysis_id": analysis_id,
@@ -157,3 +157,9 @@ def decide_analysis(
 @router.get("/api/v1/projects/{project_id}/deployments/{deployment_id}")
 def get_deployment(project_id: str, deployment_id: str, x_project_token: str = Header(...)) -> dict:
     return response(service.get_deployment(project_id, x_project_token, deployment_id))
+
+
+@router.delete("/api/v1/projects/{project_id}/deployments/{deployment_id}", status_code=status.HTTP_204_NO_CONTENT)
+def stop_deployment(project_id: str, deployment_id: str, x_project_token: str = Header(...)) -> None:
+    service.stop_deployment(project_id, x_project_token, deployment_id)
+    return None
