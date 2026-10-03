@@ -1,0 +1,212 @@
+<!doctype html><html lang="ja"><head><meta charset="utf-8">
+<title>Pawploy アーキテクチャ</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=swap">
+<style>
+  html,body{margin:0;background:#F6F7F9}
+  body{width:1600px;height:1010px;overflow:hidden;font-family:'Noto Sans JP',sans-serif}
+  svg{display:block}
+  text{font-family:'Noto Sans JP',sans-serif}
+  .grp{fill:#FFFFFF;stroke:#E2E6EC;stroke-width:1.5}
+  .grp-lbl{font-size:13px;font-weight:700;fill:#6B7280;letter-spacing:.04em}
+  .card{fill:#FFFFFF;stroke:#D5DAE1;stroke-width:1.5}
+  .card.tbd{stroke-dasharray:6 5;stroke:#B9C0CA}
+  .ttl{font-size:16px;font-weight:700;fill:#1F2937}
+  .sub{font-size:12.5px;fill:#6B7280}
+  .chip{font-size:11px;font-weight:700;fill:#fff}
+  .st{font-size:10.5px;font-weight:700;text-anchor:middle}
+  .st-done rect{fill:#DCFCE7}.st-done text{fill:#15803D}
+  .st-part rect{fill:#FEF3C7}.st-part text{fill:#B45309}
+  .st-plan rect{fill:#F3F4F6}.st-plan text{fill:#6B7280}
+  .cur{fill:none;stroke:#2563EB;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+  .pln{fill:none;stroke:#9AA3AF;stroke-width:2;stroke-dasharray:6 5;stroke-linejoin:round;stroke-linecap:round}
+  .n-cur circle{fill:#fff;stroke:#2563EB;stroke-width:2}
+  .n-cur text{fill:#2563EB}
+  .n-pln circle{fill:#fff;stroke:#9AA3AF;stroke-width:2}
+  .n-pln text{fill:#6B7280}
+  .num{font-size:12px;font-weight:700;text-anchor:middle}
+  .alabel{font-size:12px;fill:#6B7280}
+  .step{font-size:11.5px;fill:#374151}
+  .chg{font-size:13px;fill:#374151}
+  .old{fill:#9AA3AF;text-decoration:line-through}
+</style></head><body>
+<svg width="1600" height="1010" viewBox="0 0 1600 1010" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="mc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M1 1 L9 5 L1 9" fill="none" stroke="#2563EB" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></marker>
+    <marker id="mp" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M1 1 L9 5 L1 9" fill="none" stroke="#9AA3AF" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></marker>
+    <filter id="sh" x="-5%" y="-5%" width="110%" height="120%"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0F172A" flood-opacity=".06"/></filter>
+  </defs>
+
+  <!-- header -->
+  <text x="64" y="76" font-size="28" font-weight="700" fill="#111827">Pawploy アーキテクチャ</text>
+  <text x="64" y="104" font-size="14" fill="#6B7280">GitHubリポジトリひとつで分析 → 推奨 → ビルド → AWS・GCPデプロイ ・ 2026-10-02</text>
+
+  <!-- groups -->
+  <rect x="64" y="150" width="200" height="580" rx="14" class="grp"/>
+  <text x="84" y="178" class="grp-lbl">ユーザー・外部</text>
+  <rect x="304" y="150" width="940" height="580" rx="14" class="grp"/>
+  <text x="324" y="178" class="grp-lbl">PAWPLOYプラットフォーム・チームAWSアカウント（ap-northeast-2）</text>
+  <rect x="1284" y="150" width="252" height="580" rx="14" class="grp"/>
+  <text x="1304" y="178" class="grp-lbl">デプロイ対象リソース</text>
+
+  <!-- ===== cards ===== -->
+  <!-- GitHub -->
+  <g filter="url(#sh)"><rect x="84" y="220" width="160" height="88" rx="12" class="card"/></g>
+  <rect x="100" y="236" width="34" height="34" rx="8" fill="#111827"/><text x="117" y="258" class="chip" text-anchor="middle">GH</text>
+  <text x="146" y="256" class="ttl">GitHub</text>
+  <text x="146" y="276" class="sub">公開リポジトリ</text>
+  <text x="146" y="293" class="sub">コミットSHAを固定</text>
+
+  <!-- user -->
+  <g filter="url(#sh)"><rect x="84" y="384" width="160" height="88" rx="12" class="card"/></g>
+  <rect x="100" y="400" width="34" height="34" rx="8" fill="#EC4899"/><circle cx="117" cy="413" r="5" fill="#fff"/><path d="M107 428 a10 8 0 0 1 20 0" fill="#fff"/>
+  <text x="146" y="420" class="ttl" font-size="14">バイブコーダー</text>
+  <text x="146" y="440" class="sub">ブラウザ</text>
+
+  <!-- frontend -->
+  <g filter="url(#sh)"><rect x="344" y="384" width="220" height="104" rx="12" class="card"/></g>
+  <rect x="360" y="400" width="34" height="34" rx="8" fill="#2563EB"/><text x="377" y="422" class="chip" text-anchor="middle">WEB</text>
+  <text x="406" y="420" class="ttl">Frontend</text>
+  <text x="406" y="440" class="sub">React + Vite</text>
+  <text x="406" y="456" class="sub">S3 + CloudFront</text>
+  <text x="406" y="472" class="sub">app.pawploy.teampeony.net</text>
+
+  <!-- main -->
+  <g filter="url(#sh)"><rect x="620" y="384" width="240" height="88" rx="12" class="card"/></g>
+  <rect x="636" y="400" width="34" height="34" rx="8" fill="#F59E0B"/><text x="653" y="422" class="chip" text-anchor="middle">API</text>
+  <text x="682" y="420" class="ttl">Main Server</text>
+  <text x="682" y="440" class="sub">Pawploy API・FastAPI</text>
+  <text x="682" y="457" class="sub">fawploy.teampeony.net</text>
+
+  <!-- storage: DynamoDB (left) / S3 (right) -->
+  <g filter="url(#sh)"><rect x="620" y="560" width="112" height="100" rx="12" class="card"/></g>
+  <rect x="636" y="574" width="28" height="28" rx="7" fill="#7C3AED"/><text x="650" y="593" class="chip" text-anchor="middle" font-size="9">DDB</text>
+  <text x="636" y="622" class="ttl" font-size="14">DynamoDB</text>
+  <text x="636" y="639" class="sub" font-size="10.5">プロジェクト・デプロイ</text>
+  <text x="636" y="654" class="sub" font-size="10.5">状態</text>
+  <g filter="url(#sh)"><rect x="748" y="560" width="112" height="100" rx="12" class="card"/></g>
+  <rect x="764" y="574" width="28" height="28" rx="7" fill="#16A34A"/><text x="778" y="593" class="chip" text-anchor="middle">S3</text>
+  <text x="764" y="622" class="ttl" font-size="14">S3ストレージ</text>
+  <text x="764" y="639" class="sub" font-size="10.5">ソース・分析結果・</text>
+  <text x="764" y="654" class="sub" font-size="10.5">デプロイファイル</text>
+
+  <!-- AgentCore -->
+  <g filter="url(#sh)"><rect x="980" y="196" width="240" height="108" rx="12" class="card"/></g>
+  <rect x="996" y="212" width="34" height="34" rx="8" fill="#7C3AED"/><text x="1013" y="234" class="chip" text-anchor="middle" font-size="9.5">AGC</text>
+  <text x="1042" y="232" class="ttl">Bedrock AgentCore</text>
+  <text x="1042" y="252" class="sub">analyze · fix_build</text>
+  <text x="1042" y="269" class="sub">gen_terraform · fix_terraform</text>
+  <text x="1042" y="286" class="sub">Claude Sonnet 4.6 · InfraFit</text>
+
+  <!-- CodeBuild -->
+  <g filter="url(#sh)"><rect x="980" y="340" width="240" height="132" rx="12" class="card"/></g>
+  <rect x="996" y="356" width="34" height="34" rx="8" fill="#0EA5E9"/><text x="1013" y="378" class="chip" text-anchor="middle">BLD</text>
+  <text x="1042" y="376" class="ttl">CodeBuild → ECR</text>
+  <text x="1042" y="396" class="sub" font-size="10.5">AgentCoreのDockerfileでビルド</text>
+  <text x="1042" y="414" class="sub" font-size="10.5">承認と並行して事前ビルド</text>
+  <text x="1042" y="432" class="sub" font-size="10.5">digestを受け取る</text>
+  <text x="1042" y="450" class="sub" font-size="10.5">GCPはArtifact Registryへpush</text>
+
+  <!-- Terraform Worker -->
+  <g filter="url(#sh)"><rect x="980" y="484" width="240" height="120" rx="12" class="card"/></g>
+  <rect x="996" y="500" width="34" height="34" rx="8" fill="#0F766E"/><text x="1013" y="522" class="chip" text-anchor="middle">TF</text>
+  <text x="1042" y="520" class="ttl">Terraform Worker</text>
+  <text x="1042" y="540" class="sub" font-size="10.5">SQS FIFO → ECS Fargate</text>
+  <text x="1042" y="557" class="sub" font-size="10.5">IaC検査・planポリシー検査</text>
+  <text x="1042" y="574" class="sub" font-size="10.5">apply · AIなし</text>
+  <text x="1042" y="591" class="sub" font-size="10.5">AgentCoreモジュールのみ実行</text>
+
+  <!-- queues -->
+  <g filter="url(#sh)"><rect x="980" y="624" width="240" height="84" rx="12" class="card"/></g>
+  <rect x="996" y="638" width="34" height="34" rx="8" fill="#DC2626"/><text x="1013" y="660" class="chip" text-anchor="middle">SQS</text>
+  <text x="1042" y="658" class="ttl" font-size="14">デプロイジョブキュー</text>
+  <text x="1042" y="678" class="sub" font-size="11.5">pawploy-jobs.fifo</text>
+  <text x="1042" y="695" class="sub" font-size="10.5">destroyキュー・期限処理</text>
+
+  <!-- deploy targets -->
+  <g filter="url(#sh)"><rect x="1304" y="384" width="212" height="120" rx="12" class="card"/></g>
+  <rect x="1320" y="400" width="34" height="34" rx="8" fill="#F59E0B"/><text x="1337" y="422" class="chip" text-anchor="middle">AWS</text>
+  <text x="1366" y="418" class="ttl" font-size="14">AWS・チーム</text>
+  <text x="1366" y="435" class="ttl" font-size="14">アカウント</text>
+  <text x="1366" y="456" class="sub" font-size="11.5">EC2 (t3)・Lambda</text>
+  <text x="1366" y="472" class="sub" font-size="11.5">Function URL</text>
+
+  <g filter="url(#sh)"><rect x="1304" y="536" width="212" height="104" rx="12" class="card"/></g>
+  <rect x="1320" y="552" width="34" height="34" rx="8" fill="#EA4335"/><text x="1337" y="574" class="chip" text-anchor="middle">GCP</text>
+  <text x="1366" y="572" class="ttl">GCP Cloud Run</text>
+  <text x="1366" y="592" class="sub" font-size="11.5">Artifact Registry</text>
+  <text x="1366" y="608" class="sub" font-size="11.5">イメージ</text>
+
+  <text x="1304" y="660" class="sub">AWS・GCPのどちらか一方を選択</text>
+  <text x="1304" y="678" class="sub" font-size="11.5">60分後に自動削除（テスト環境）</text>
+
+  <!-- ===== arrows ===== -->
+  <!-- 1 user -> frontend -> main -->
+  <path class="cur" d="M244 428 H344" marker-end="url(#mc)"/>
+  <g class="n-cur"><circle cx="294" cy="428" r="11"/><text x="294" y="432" class="num">1</text></g>
+  <path class="cur" d="M564 412 H620" marker-end="url(#mc)"/>
+  <path class="cur" d="M620 444 H564" marker-end="url(#mc)"/>
+  <g class="n-cur"><circle cx="592" cy="444" r="11"/><text x="592" y="448" class="num">5</text></g>
+  <!-- 2 main -> GitHub, main -> storage -->
+  <path class="cur" d="M740 384 V264 H244" marker-end="url(#mc)"/>
+  <g class="n-cur"><circle cx="500" cy="264" r="11"/><text x="500" y="268" class="num">2</text></g>
+  <text x="640" y="254" class="alabel" text-anchor="middle">SHA固定・tarballダウンロード</text>
+  <path class="cur" d="M676 472 V560" marker-end="url(#mc)"/>
+  <path class="cur" d="M804 472 V560" marker-end="url(#mc)"/>
+  <g class="n-cur"><circle cx="676" cy="500" r="11"/><text x="676" y="504" class="num">2</text></g>
+  <!-- 3·6 main -> AgentCore -->
+  <path class="cur" d="M860 400 H910 V250 H980" marker-end="url(#mc)"/>
+  <g class="n-cur"><circle cx="910" cy="325" r="13"/><text x="910" y="329" class="num">3·6</text></g>
+  <!-- 4 main -> CodeBuild -->
+  <path class="cur" d="M860 428 H980" marker-end="url(#mc)"/>
+  <g class="n-cur"><circle cx="935" cy="428" r="11"/><text x="935" y="432" class="num">4</text></g>
+  <!-- 7 main -> S3 -> SQS -> worker -->
+  <path class="cur" d="M804 472 V560" marker-end="url(#mc)"/>
+  <path class="cur" d="M860 456 H940 V666 H980" marker-end="url(#mc)"/>
+  <g class="n-cur"><circle cx="900" cy="456" r="11"/><text x="900" y="460" class="num">7</text></g>
+  <path class="cur" d="M1100 624 V592" marker-end="url(#mc)"/>
+  <!-- worker -> targets -->
+  <path class="cur" d="M1220 520 H1262 V439 H1304" marker-end="url(#mc)"/>
+  <path class="cur" d="M1220 556 H1262 V575 H1304" marker-end="url(#mc)"/>
+  <text x="1262" y="542" class="alabel" text-anchor="middle">apply</text>
+  <!-- 8 worker result -> shared DynamoDB -> Main Server -> Frontend -->
+  <path class="cur" d="M980 574 H940 V720 H600 V640 H620" marker-end="url(#mc)"/>
+  <path class="cur" d="M676 560 V520 H740 V472" marker-end="url(#mc)"/>
+  <g class="n-cur"><circle cx="900" cy="720" r="11"/><text x="900" y="724" class="num">8</text></g>
+
+  <!-- ===== steps ===== -->
+  <line x1="64" y1="776" x2="1536" y2="776" stroke="#E2E6EC" stroke-width="1.5"/>
+
+  <g class="n-cur"><circle cx="76" cy="806" r="10"/><text x="76" y="810" class="num" font-size="11">1</text></g>
+  <text x="96" y="811" class="step"><tspan font-weight="700" fill="#1F2937">GitHub URLを提出。</tspan> 公開GitHubリポジトリのURLとブランチ（任意）を入力する。</text>
+  <text x="96" y="829" class="step">プロジェクトトークンが発行され、以後のすべてのリクエストはこのトークンで認証する。</text>
+
+  <g class="n-cur"><circle cx="76" cy="854" r="10"/><text x="76" y="858" class="num" font-size="11">2</text></g>
+  <text x="96" y="859" class="step" textLength="710" lengthAdjust="spacingAndGlyphs"><tspan font-weight="700" fill="#1F2937">コミット固定・スナップショット。</tspan> Main ServerがGitHub APIでコミットSHAを固定し、tarballを取得してS3に保存する。</text>
+  <text x="96" y="877" class="step">Frontendが状態 queued → downloading → ready をポーリングする。</text>
+
+  <g class="n-cur"><circle cx="76" cy="902" r="10"/><text x="76" y="906" class="num" font-size="11">3</text></g>
+  <text x="96" y="907" class="step" textLength="710" lengthAdjust="spacingAndGlyphs"><tspan font-weight="700" fill="#1F2937">分析・推奨。</tspan> Main ServerがAgentCoreのanalyzeを呼び出す。InfraFitのインベントリとClaudeがコードを直接読み取り、</text>
+  <text x="96" y="925" class="step">推奨（1～5位・根拠・コスト・権限）とDockerfile・buildspecを作成してS3に保存する。</text>
+
+  <g class="n-cur"><circle cx="76" cy="950" r="10"/><text x="76" y="954" class="num" font-size="11">4</text></g>
+  <text x="96" y="955" class="step" textLength="710" lengthAdjust="spacingAndGlyphs"><tspan font-weight="700" fill="#1F2937">事前ビルド。</tspan> Main ServerがCodeBuildを開始し、ECR（+ Artifact Registry）へpushしてdigestを受け取る。</text>
+  <text x="96" y="973" class="step" textLength="710" lengthAdjust="spacingAndGlyphs">失敗時はfix_buildでDockerfileを修正して再ビルド（最大3回）。ユーザーの確認と並行して実行される。</text>
+
+  <g class="n-cur"><circle cx="836" cy="806" r="10"/><text x="836" y="810" class="num" font-size="11">5</text></g>
+  <text x="856" y="811" class="step" textLength="660" lengthAdjust="spacingAndGlyphs"><tspan font-weight="700" fill="#1F2937">ユーザー確認。</tspan> 推奨案・理由・コスト・権限を表示して承認（AWSまたはGCPのどちらか一方を選択）</text>
+  <text x="856" y="829" class="step">または修正リクエストを受け付ける。修正の場合は3から再実行する。</text>
+
+  <g class="n-cur"><circle cx="836" cy="854" r="10"/><text x="836" y="858" class="num" font-size="11">6</text></g>
+  <text x="856" y="859" class="step" textLength="660" lengthAdjust="spacingAndGlyphs"><tspan font-weight="700" fill="#1F2937">Terraform生成。</tspan> Main Serverがgen_terraformを呼び出す。AgentCoreがクラウド別モジュールを</text>
+  <text x="856" y="877" class="step">pawploy-agentバケットのprojects/…/deploy/&lt;deploy_id&gt;/attempt-N/に保存する。</text>
+
+  <g class="n-cur"><circle cx="836" cy="902" r="10"/><text x="836" y="906" class="num" font-size="11">7</text></g>
+  <text x="856" y="907" class="step" textLength="660" lengthAdjust="spacingAndGlyphs"><tspan font-weight="700" fill="#1F2937">検証・apply。</tspan> Main ServerがジョブJSONをWorker S3に置いてSQSに送ると、FargateワーカーがIaC検査 → planポリシー</text>
+  <text x="856" y="925" class="step" textLength="660" lengthAdjust="spacingAndGlyphs">検査 → apply → ヘルスチェック。失敗時はリソースを削除して報告 → fix_terraform → 同じdeploy_idで再試行（最大3回）。</text>
+
+  <g class="n-cur"><circle cx="836" cy="950" r="10"/><text x="836" y="954" class="num" font-size="11">8</text></g>
+  <text x="856" y="955" class="step" textLength="660" lengthAdjust="spacingAndGlyphs"><tspan font-weight="700" fill="#1F2937">結果・自動削除。</tspan> 接続URLを表示する。60分後にScheduler → SQS → destroy、</text>
+  <text x="856" y="973" class="step" textLength="660" lengthAdjust="spacingAndGlyphs">5～10分間隔のsweepとタグ監視によるorphan検出で三重にクリーンアップする。</text>
+
+</svg>
+</body></html>

@@ -126,7 +126,7 @@ def decide_analysis(
         service.table().put_item(Item={
             "pk": f"PROJECT#{project_id}", "sk": f"DEPLOYMENT#{deployment_id}",
             "deployment_id": deployment_id, "analysis_id": analysis_id,
-            "status": "running", "step": "build", "target": body.target,
+            "status": "running", "step": "build", "target": body.target, "build_attempt": 1,
             "build_id": build["build_id"], "created_at": service.now(), "updated_at": service.now(),
         })
         background_tasks.add_task(service.monitor_deployment_build, project_id, deployment_id, analysis_id, build["build_id"])

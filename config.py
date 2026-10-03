@@ -14,4 +14,5 @@ WORKER_ARTIFACT_BUCKET = os.environ.get("WORKER_ARTIFACT_BUCKET", "pawploy-tf-13
 WORKER_STATUS_TABLE = os.environ.get("WORKER_STATUS_TABLE", "pawploy-deployments")
 BUILD_POLL_SECONDS = int(os.environ.get("BUILD_POLL_SECONDS", "5"))
 BUILD_TIMEOUT_SECONDS = int(os.environ.get("BUILD_TIMEOUT_SECONDS", "1800"))
+BUILD_MAX_ATTEMPTS = int(os.environ.get("BUILD_MAX_ATTEMPTS", "3"))
 CORS_ORIGINS = [origin.strip() for origin in os.environ.get("CORS_ORIGINS", "https://app.pawploy.teampeony.net,https://deploy-puppy.64bit.kr,http://localhost:5173,http://127.0.0.1:5173").split(",") if origin.strip()]

@@ -16,7 +16,7 @@ import boto3
 from boto3.s3.transfer import TransferConfig
 from botocore.exceptions import ClientError
 
-from config import AGENTCORE_REGION, AGENT_RUNTIME_ARN, AWS_REGION, BUILD_POLL_SECONDS, BUILD_TIMEOUT_SECONDS, CODEBUILD_PROJECT, GITHUB_TOKEN, PROJECTS_TABLE, SOURCE_BUCKET, WORKER_ARTIFACT_BUCKET, WORKER_DESTROY_QUEUE_URL, WORKER_QUEUE_URL, WORKER_REGION, WORKER_STATUS_TABLE
+from config import AGENTCORE_REGION, AGENT_RUNTIME_ARN, AWS_REGION, BUILD_MAX_ATTEMPTS, BUILD_POLL_SECONDS, BUILD_TIMEOUT_SECONDS, CODEBUILD_PROJECT, GITHUB_TOKEN, PROJECTS_TABLE, SOURCE_BUCKET, WORKER_ARTIFACT_BUCKET, WORKER_DESTROY_QUEUE_URL, WORKER_QUEUE_URL, WORKER_REGION, WORKER_STATUS_TABLE
 
 logger = logging.getLogger(__name__)
 GITHUB_API = "https://api.github.com"
@@ -61,6 +61,11 @@ def agentcore():
 @lru_cache
 def codebuild():
     return boto3.client("codebuild", region_name=AWS_REGION)
+
+
+@lru_cache
+def logs():
+    return boto3.client("logs", region_name=AWS_REGION)
 
 
 @lru_cache
@@ -299,8 +304,9 @@ def run_analysis(project_id: str, source_id: str, commit_sha: str, source_key: s
         )
 
 
-def get_analysis(project_id: str, project_token: str, analysis_id: str) -> dict:
-    require_project(project_id, project_token)
+def get_analysis(project_id: str, project_token: str, analysis_id: str, trusted: bool = False) -> dict:
+    if not trusted:
+        require_project(project_id, project_token)
     item = table().get_item(Key={"pk": f"PROJECT#{project_id}", "sk": f"ANALYSIS#{analysis_id}"}).get("Item")
     if not item:
         raise ServiceError(404, "분석 작업을 찾을 수 없습니다.")
@@ -320,13 +326,14 @@ def get_analysis(project_id: str, project_token: str, analysis_id: str) -> dict:
     return result
 
 
-def start_build(project_id: str, project_token: str, analysis_id: str) -> dict:
+def start_build(project_id: str, project_token: str, analysis_id: str, build_files_override: dict | None = None, attempt: int = 1, trusted: bool = False) -> dict:
     """분석 결과의 소스와 build_files를 CodeBuild에 전달해 이미지 빌드를 시작한다."""
-    require_project(project_id, project_token)
-    analysis = get_analysis(project_id, project_token, analysis_id)
+    if not trusted:
+        require_project(project_id, project_token)
+    analysis = get_analysis(project_id, project_token, analysis_id, trusted=trusted)
     if analysis.get("status") not in {"analyzed", "ok"} or not analysis.get("recommendation"):
         raise ServiceError(409, "분석이 완료된 뒤 이미지를 빌드할 수 있습니다.")
-    files = analysis.get("build_files") or {}
+    files = build_files_override or analysis.get("build_files") or {}
     source_uri = analysis.get("source_uri")
     files_uri = files.get("uri_prefix")
     if not source_uri or not files_uri:
@@ -353,10 +360,24 @@ def start_build(project_id: str, project_token: str, analysis_id: str) -> dict:
     build_id = result["id"]
     table().update_item(
         Key={"pk": f"PROJECT#{project_id}", "sk": f"ANALYSIS#{analysis_id}"},
-        UpdateExpression="SET build_id = :id, build_status = :status, updated_at = :updated_at",
-        ExpressionAttributeValues={":id": build_id, ":status": result.get("buildStatus", "IN_PROGRESS"), ":updated_at": now()},
+        UpdateExpression="SET build_id = :id, build_status = :status, build_attempt = :attempt, build_files_uri = :files_uri, dockerfile = :dockerfile, updated_at = :updated_at",
+        ExpressionAttributeValues={":id": build_id, ":status": result.get("buildStatus", "IN_PROGRESS"), ":attempt": attempt, ":files_uri": files.get("uri_prefix", ""), ":dockerfile": files.get("dockerfile", ""), ":updated_at": now()},
     )
-    return {"build_id": build_id, "analysis_id": analysis_id, "status": result.get("buildStatus", "IN_PROGRESS"), "image_tag": image_tag}
+    return {"build_id": build_id, "analysis_id": analysis_id, "status": result.get("buildStatus", "IN_PROGRESS"), "image_tag": image_tag, "attempt": attempt}
+
+
+def _image_digests(images: dict) -> dict:
+    """Parse the multi-image CodeBuild export without breaking single-image builds."""
+    value = images.get("IMAGE_DIGESTS") if isinstance(images, dict) else None
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def get_build(project_id: str, project_token: str, analysis_id: str) -> dict:
@@ -373,11 +394,18 @@ def get_build(project_id: str, project_token: str, analysis_id: str) -> dict:
     result = {"build_id": item["build_id"], "analysis_id": analysis_id, "status": status,
               "phase": build.get("currentPhase"),
               "ecr_image_uri": exported.get("ECR_IMAGE_URI"), "gcp_image_uri": exported.get("GCP_IMAGE_URI")}
+    result["attempt"] = item.get("build_attempt", 1)
     if exported.get("IMAGE_DIGESTS"):
         try:
             result["image_digests"] = json.loads(exported["IMAGE_DIGESTS"])
         except json.JSONDecodeError:
             result["image_digests"] = {}
+    if status == "SUCCEEDED" and result.get("image_digests"):
+        table().update_item(
+            Key={"pk": f"PROJECT#{project_id}", "sk": f"ANALYSIS#{analysis_id}"},
+            UpdateExpression="SET image_digests = :digests",
+            ExpressionAttributeValues={":digests": result["image_digests"]},
+        )
     table().update_item(Key={"pk": f"PROJECT#{project_id}", "sk": f"ANALYSIS#{analysis_id}"},
                         UpdateExpression="SET build_status = :status, updated_at = :updated_at",
                         ExpressionAttributeValues={":status": status, ":updated_at": now()})
@@ -396,9 +424,9 @@ def get_deployment(project_id: str, project_token: str, deployment_id: str) -> d
             # 프론트의 상태 폴링을 계기로 gen_terraform을 반드시 시작한다.
             table().update_item(
                 Key={"pk": f"PROJECT#{project_id}", "sk": f"DEPLOYMENT#{deployment_id}"},
-                UpdateExpression="SET #status = :status, #step = :step, ecr_image_uri = :ecr, gcp_image_uri = :gcp, updated_at = :updated_at",
+                UpdateExpression="SET #status = :status, #step = :step, ecr_image_uri = :ecr, gcp_image_uri = :gcp, image_digests = :digests, updated_at = :updated_at",
                 ExpressionAttributeNames={"#status": "status", "#step": "step"},
-                ExpressionAttributeValues={":status": "running", ":step": "terraform", ":ecr": build.get("ecr_image_uri", ""), ":gcp": build.get("gcp_image_uri", ""), ":updated_at": now()},
+                ExpressionAttributeValues={":status": "running", ":step": "terraform", ":ecr": build.get("ecr_image_uri", ""), ":gcp": build.get("gcp_image_uri", ""), ":digests": build.get("image_digests", {}), ":updated_at": now()},
             )
             item = table().get_item(Key={"pk": f"PROJECT#{project_id}", "sk": f"DEPLOYMENT#{deployment_id}"}).get("Item") or item
         else:
@@ -410,7 +438,7 @@ def get_deployment(project_id: str, project_token: str, deployment_id: str) -> d
         # CodeBuild 성공 후 서버 재시작/배경 작업 중단으로 누락된 Terraform 생성을 복구한다.
         generate_deployment_terraform(
             project_id, deployment_id, item["analysis_id"],
-            {"ECR_IMAGE_URI": item.get("ecr_image_uri", ""), "GCP_IMAGE_URI": item.get("gcp_image_uri", "")},
+            {"ECR_IMAGE_URI": item.get("ecr_image_uri", ""), "GCP_IMAGE_URI": item.get("gcp_image_uri", ""), "IMAGE_DIGESTS": json.dumps(item.get("image_digests", {}))},
         )
         item = table().get_item(Key={"pk": f"PROJECT#{project_id}", "sk": f"DEPLOYMENT#{deployment_id}"}).get("Item") or item
     result = {key: item[key] for key in ("deployment_id", "status", "step", "target", "ecr_image_uri", "gcp_image_uri", "reason", "url", "expires_at", "worker_deploy_id") if key in item}
@@ -445,9 +473,82 @@ def get_deployment(project_id: str, project_token: str, deployment_id: str) -> d
     return result
 
 
+def _build_log_tail(build: dict) -> str:
+    """CodeBuild 로그의 마지막 부분만 AgentCore에 전달한다."""
+    log_info = build.get("logs") or {}
+    group = log_info.get("groupName")
+    stream = log_info.get("streamName")
+    if not group or not stream:
+        return f"CodeBuild {build.get('buildStatus', 'FAILED')} (로그 스트림을 찾을 수 없음)"
+    try:
+        events = logs().get_log_events(
+            logGroupName=group, logStreamName=stream, startFromHead=False, limit=200,
+        ).get("events", [])
+        return "\n".join(event.get("message", "") for event in events)[-12000:]
+    except Exception:
+        logger.exception("CodeBuild log read failed for %s", stream)
+        return f"CodeBuild {build.get('buildStatus', 'FAILED')} (로그를 읽지 못함)"
+
+
+def _retry_failed_build(project_id: str, deployment_id: str, analysis_id: str, build: dict, attempt: int) -> str | None:
+    """실패 로그를 AgentCore fix_build에 전달하고 수정된 파일로 다음 빌드를 시작한다."""
+    if attempt > BUILD_MAX_ATTEMPTS:
+        return None
+    analysis = table().get_item(Key={"pk": f"PROJECT#{project_id}", "sk": f"ANALYSIS#{analysis_id}"}).get("Item") or {}
+    source_uri = f"s3://{SOURCE_BUCKET}/{analysis.get('source_key', '')}" if analysis.get("source_key") else analysis.get("source_uri", "")
+    dockerfile = analysis.get("dockerfile", "")
+    if not source_uri or not dockerfile:
+        logger.warning("Cannot retry build %s: source_uri or dockerfile is missing", deployment_id)
+        return None
+    try:
+        response = agentcore().invoke_agent_runtime(
+            agentRuntimeArn=AGENT_RUNTIME_ARN,
+            runtimeSessionId=f"pawploy-fix-build-{project_id}-{deployment_id}-{attempt}",
+            payload=json.dumps({
+                "mode": "fix_build", "project_id": project_id, "analysis_id": analysis_id,
+                "source_uri": source_uri, "dockerfile": dockerfile,
+                "build_log": _build_log_tail(build), "failed_phase": build.get("currentPhase") or "BUILD",
+                "attempt": attempt,
+            }).encode(),
+        )
+        fixed = json.loads(response["response"].read())
+        files = fixed.get("build_files") or {}
+        if fixed.get("status") != "ok" or not files.get("uri_prefix"):
+            logger.warning("AgentCore fix_build did not produce a retry for %s: %s", deployment_id, fixed)
+            return None
+        # 기존 AgentCore fix_build 응답은 새 URI와 Dockerfile만 반환한다.
+        # buildspec은 최초 분석 결과의 것을 재사용해 AgentCore 변경 없이 재빌드한다.
+        if not files.get("buildspec") and analysis.get("result_key"):
+            try:
+                original = json.loads(s3().get_object(Bucket=SOURCE_BUCKET, Key=analysis["result_key"])["Body"].read())
+                original_build_files = original.get("build_files") or {}
+                if original_build_files.get("buildspec"):
+                    files["buildspec"] = original_build_files["buildspec"]
+            except (ClientError, ValueError, UnicodeDecodeError):
+                logger.warning("Original buildspec unavailable for retry %s", deployment_id)
+        table().update_item(
+            Key={"pk": f"PROJECT#{project_id}", "sk": f"DEPLOYMENT#{deployment_id}"},
+            UpdateExpression="SET #status = :status, #step = :step, build_attempt = :attempt, build_reason = :reason, updated_at = :updated_at",
+            ExpressionAttributeNames={"#status": "status", "#step": "step"},
+            ExpressionAttributeValues={":status": "running", ":step": f"fix({attempt}/{BUILD_MAX_ATTEMPTS})", ":attempt": attempt, ":reason": fixed.get("cause", ""), ":updated_at": now()},
+        )
+        retry = start_build(project_id, "", analysis_id, files, attempt + 1, trusted=True)
+        table().update_item(
+            Key={"pk": f"PROJECT#{project_id}", "sk": f"DEPLOYMENT#{deployment_id}"},
+            UpdateExpression="SET #status = :status, #step = :step, updated_at = :updated_at",
+            ExpressionAttributeNames={"#status": "status", "#step": "step"},
+            ExpressionAttributeValues={":status": "running", ":step": "build", ":updated_at": now()},
+        )
+        return retry["build_id"]
+    except Exception:
+        logger.exception("CodeBuild fix retry failed for %s", deployment_id)
+        return None
+
+
 def monitor_deployment_build(project_id: str, deployment_id: str, analysis_id: str, build_id: str) -> None:
-    """CodeBuild 완료를 메인 서버 상태에 반영한다. 브라우저가 닫혀도 상태가 남는다."""
+    """CodeBuild 완료를 반영하고 실패하면 AgentCore fix_build를 최대 3회 수행한다."""
     deadline = time.monotonic() + BUILD_TIMEOUT_SECONDS
+    attempt = 1
     while time.monotonic() < deadline:
         try:
             build = codebuild().batch_get_builds(ids=[build_id])["builds"][0]
@@ -456,18 +557,32 @@ def monitor_deployment_build(project_id: str, deployment_id: str, analysis_id: s
                 exported = {v["name"]: v["value"] for v in build.get("exportedEnvironmentVariables", [])}
                 table().update_item(
                     Key={"pk": f"PROJECT#{project_id}", "sk": f"DEPLOYMENT#{deployment_id}"},
-                    UpdateExpression="SET #status = :status, #step = :step, build_status = :build_status, ecr_image_uri = :ecr, gcp_image_uri = :gcp, updated_at = :updated_at",
+                    UpdateExpression="SET #status = :status, #step = :step, build_status = :build_status, ecr_image_uri = :ecr, gcp_image_uri = :gcp, image_digests = :digests, updated_at = :updated_at",
                     ExpressionAttributeNames={"#status": "status", "#step": "step"},
-                    ExpressionAttributeValues={":status": "succeeded", ":step": "build", ":build_status": "SUCCEEDED", ":ecr": exported.get("ECR_IMAGE_URI", ""), ":gcp": exported.get("GCP_IMAGE_URI", ""), ":updated_at": now()},
+                    ExpressionAttributeValues={":status": "succeeded", ":step": "build", ":build_status": "SUCCEEDED", ":ecr": exported.get("ECR_IMAGE_URI", ""), ":gcp": exported.get("GCP_IMAGE_URI", ""), ":digests": _image_digests(exported), ":updated_at": now()},
                 )
                 generate_deployment_terraform(project_id, deployment_id, analysis_id, exported)
                 return
             if status in {"FAILED", "FAULT", "STOPPED", "TIMED_OUT"}:
+                if attempt <= BUILD_MAX_ATTEMPTS:
+                    # AgentCore를 호출하는 동안에도 프론트가 실패로 확정하지 않도록
+                    # 먼저 자동 복구 단계로 공개한다.
+                    table().update_item(
+                        Key={"pk": f"PROJECT#{project_id}", "sk": f"DEPLOYMENT#{deployment_id}"},
+                        UpdateExpression="SET #status = :status, #step = :step, updated_at = :updated_at",
+                        ExpressionAttributeNames={"#status": "status", "#step": "step"},
+                        ExpressionAttributeValues={":status": "running", ":step": f"fix({attempt}/{BUILD_MAX_ATTEMPTS})", ":updated_at": now()},
+                    )
+                    retry_id = _retry_failed_build(project_id, deployment_id, analysis_id, build, attempt)
+                    if retry_id:
+                        build_id = retry_id
+                        attempt += 1
+                        continue
                 table().update_item(
                     Key={"pk": f"PROJECT#{project_id}", "sk": f"DEPLOYMENT#{deployment_id}"},
                     UpdateExpression="SET #status = :status, reason = :reason, updated_at = :updated_at",
                     ExpressionAttributeNames={"#status": "status"},
-                    ExpressionAttributeValues={":status": "failed", ":reason": f"CodeBuild {status}", ":updated_at": now()},
+                    ExpressionAttributeValues={":status": "failed", ":reason": f"CodeBuild {status} (자동 수정 {attempt}/{BUILD_MAX_ATTEMPTS})", ":updated_at": now()},
                 )
                 return
         except Exception:
@@ -561,8 +676,18 @@ def enqueue_worker_deployment(project_id: str, deployment_id: str, analysis_id: 
     if not generated:
         generated = next((target for target in targets if target.get("cloud") == cloud), None)
     terraform_uri = (generated or {}).get("module_uri") or (generated or {}).get("terraform_uri")
-    image_uri = images.get("ECR_IMAGE_URI") if cloud == "aws" else images.get("GCP_IMAGE_URI")
-    if not image_uri or not terraform_uri:
+    if architecture == "ec2_compose":
+        digests = _image_digests(images)
+        if not digests or not terraform_uri:
+            raise ServiceError(502, "Terraform-worker에 전달할 이미지 또는 Terraform 모듈 경로가 없습니다.")
+        target = {"cloud": "aws", "architecture": architecture, "images": digests, "terraform_uri": terraform_uri}
+    else:
+        image_uri = images.get("ECR_IMAGE_URI") if cloud == "aws" else images.get("GCP_IMAGE_URI")
+        if not image_uri or not terraform_uri:
+            raise ServiceError(502, "Terraform-worker에 전달할 이미지 또는 Terraform 모듈 경로가 없습니다.")
+        target = {"cloud": cloud, "architecture": architecture, "image_uri": image_uri, "terraform_uri": terraform_uri}
+
+    if not terraform_uri:
         raise ServiceError(502, "Terraform-worker에 전달할 이미지 또는 Terraform 모듈 경로가 없습니다.")
 
     # Worker의 ID 규칙(소문자·숫자·하이픈)에 맞춘 별도 ID를 사용한다.
@@ -576,7 +701,7 @@ def enqueue_worker_deployment(project_id: str, deployment_id: str, analysis_id: 
         "size": recommendation.get("size", "small"),
         "health_path": recommendation.get("health_path", "/"),
         "env": recommendation.get("env") or {},
-        "targets": [{"cloud": cloud, "architecture": architecture, "image_uri": image_uri, "terraform_uri": terraform_uri}],
+        "targets": [target],
     }
     boto3.client("s3", region_name=WORKER_REGION).put_object(
         Bucket=WORKER_ARTIFACT_BUCKET, Key=key,
